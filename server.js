@@ -3009,13 +3009,21 @@ const mod_registration = (d, C) => {
     res.json({ requiredDocuments: REQUIRED_DOCS, programs: programs.map((p) => ({ ...p, levels: levels.filter((l) => l.program_id === p.id) })) });
   }));
   router.post('/public/applications', authLimiter, asyncHandler(async (req, res) => {
-    const { fullName, phone, email, birthDate, programId, levelId } = req.body;
-    if (!fullName || !phone || !programId) throw C.err(400, 'Nom, téléphone et filière requis.');
+    const { fullName, phone, email, birthDate, programId, levelId, programName, levelName } = req.body;
+    // Accepte soit un programId (UUID) soit un programName en texte libre
+    if (!fullName || !phone || (!programId && !programName)) {
+      throw C.err(400, 'Nom, téléphone et filière requis.');
+    }
     const code = `PRE-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
     const id = crypto.randomUUID();
+    // Note stocke la filière/niveau saisis en libre si pas d'ID
+    const noteParts = [];
+    if (programName) noteParts.push(`Filière: ${String(programName).trim()}`);
+    if (levelName) noteParts.push(`Niveau: ${String(levelName).trim()}`);
+    const note = noteParts.length ? noteParts.join(' | ') : null;
     await pool.query(
-      `INSERT INTO applications (id, code, full_name, phone, email, birth_date, program_id, level_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [id, code, fullName, normalizePhone(phone), email ? normalizeEmail(email) : null, birthDate || null, programId, levelId || null]);
+      `INSERT INTO applications (id, code, full_name, phone, email, birth_date, program_id, level_id, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [id, code, fullName, normalizePhone(phone), email ? normalizeEmail(email) : null, birthDate || null, programId || null, levelId || null, note]);
     await sendSms(normalizePhone(phone), `UniConnect : dossier ${code} reçu. Déposez vos pièces et suivez son état avec ce code.`);
     res.status(201).json({ code, requiredDocuments: REQUIRED_DOCS, message: 'Dossier créé. Déposez maintenant vos pièces justificatives.' });
   }));
