@@ -3079,6 +3079,20 @@ const mod_registration = (d, C) => {
     await pool.query('DELETE FROM application_documents WHERE application_id=$1 AND doc_type=$2', [a.id, req.params.docType]);
     res.json({ message: 'Fichiers supprimés.' });
   }));
+  // Soumettre le dossier à la scolarité (toutes les pièces requises doivent être présentes)
+  router.post('/public/applications/:code/submit', docLimiter, asyncHandler(async (req, res) => {
+    const a = await loadApplication(req.params.code, req.body.phone || req.query.phone);
+    if (['accepte', 'refuse'].includes(a.status)) throw C.err(400, 'Dossier déjà clôturé.');
+    const docs = (await pool.query('SELECT doc_type FROM application_documents WHERE application_id=$1', [a.id])).rows.map((r) => r.doc_type);
+    const missing = REQUIRED_DOCS.filter((x) => !docs.includes(x));
+    if (missing.length) throw C.err(400, `Pièces manquantes : ${missing.join(', ')}.`);
+    await pool.query(`UPDATE applications SET status='en_examen', updated_at=now() WHERE id=$1`, [a.id]);
+    try {
+      await sendSms(a.phone, `UniConnect : votre dossier ${a.code} est complet et en cours d'examen. Vous recevrez votre matricule par SMS dès la validation.`);
+    } catch (_) {}
+    res.json({ message: 'Dossier soumis à la scolarité.', status: 'en_examen' });
+  }));
+
   // Supprimer un seul fichier d'une pièce
   router.delete('/public/applications/:code/documents/file/:docId', docLimiter, asyncHandler(async (req, res) => {
     const a = await loadApplication(req.params.code, req.query.phone);
