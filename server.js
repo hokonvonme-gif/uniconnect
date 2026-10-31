@@ -3059,20 +3059,66 @@ const mod_registration = (d, C) => {
     const realMime = sniffMime(req.file.buffer);
     if (!realMime) throw C.err(400, 'Format non pris en charge : envoyez un PDF, JPG ou PNG.');
     req.file.mimetype = realMime;
-    const count = Number((await pool.query('SELECT COUNT(*) FROM application_documents WHERE application_id=$1', [a.id])).rows[0].count);
-    if (count >= 12) throw C.err(400, 'Nombre maximal de pièces atteint.');
-    const fileId = await C.saveFile(req.file, null);
-    if (req.body.docType !== 'autre') {
+    // Plusieurs fichiers par pièce (jusqu'à 10) ; replace=1 remplace tous les fichiers de la pièce.
+    if (['1', 'true'].includes(String(req.body.replace))) {
       await pool.query('DELETE FROM application_documents WHERE application_id=$1 AND doc_type=$2', [a.id, req.body.docType]);
     }
+    const perType = Number((await pool.query('SELECT COUNT(*) FROM application_documents WHERE application_id=$1 AND doc_type=$2', [a.id, req.body.docType])).rows[0].count);
+    if (perType >= 10) throw C.err(400, 'Maximum 10 fichiers pour cette pièce.');
+    const count = Number((await pool.query('SELECT COUNT(*) FROM application_documents WHERE application_id=$1', [a.id])).rows[0].count);
+    if (count >= 60) throw C.err(400, 'Nombre maximal de fichiers atteint.');
+    const fileId = await C.saveFile(req.file, null);
     await pool.query('INSERT INTO application_documents (id, application_id, doc_type, file_id) VALUES ($1,$2,$3,$4)', [crypto.randomUUID(), a.id, req.body.docType, fileId]);
     if (a.status === 'pieces_manquantes') await pool.query(`UPDATE applications SET status='en_examen', updated_at=now() WHERE id=$1`, [a.id]);
     res.status(201).json({ message: 'Pièce enregistrée.' });
   }));
+  router.delete('/public/applications/:code/documents/:docType', docLimiter, asyncHandler(async (req, res) => {
+    const a = await loadApplication(req.params.code, req.query.phone);
+    if (['accepte', 'refuse'].includes(a.status)) throw C.err(400, 'Dossier clôturé.');
+    if (!DOC_TYPES.includes(req.params.docType)) throw C.err(400, 'docType invalide.');
+    await pool.query('DELETE FROM application_documents WHERE application_id=$1 AND doc_type=$2', [a.id, req.params.docType]);
+    res.json({ message: 'Fichiers supprimés.' });
+  }));
+  // Supprimer un seul fichier d'une pièce
+  router.delete('/public/applications/:code/documents/file/:docId', docLimiter, asyncHandler(async (req, res) => {
+    const a = await loadApplication(req.params.code, req.query.phone);
+    if (['accepte', 'refuse'].includes(a.status)) throw C.err(400, 'Dossier clôturé.');
+    await pool.query('DELETE FROM application_documents WHERE id=$1 AND application_id=$2', [req.params.docId, a.id]);
+    res.json({ message: 'Fichier supprimé.' });
+  }));
+
+  // Retrouver son dossier depuis la base (autre téléphone, app réinstallée, redémarrage…)
+  // en confirmant le numéro par SMS. Rien n'est conservé sur le mobile.
+  router.post('/public/applications/find/request', authLimiter, asyncHandler(async (req, res) => {
+    const norm = normalizePhone(req.body.phone || '');
+    if (norm.length < 8) throw C.err(400, 'Numéro de téléphone invalide.');
+    const found = await pool.query('SELECT 1 FROM applications WHERE phone=$1 LIMIT 1', [norm]);
+    if (!found.rowCount) throw C.err(404, 'Aucun dossier trouvé pour ce numéro.');
+    const last = otpCooldown.get(`find:${norm}`) || 0;
+    if (Date.now() - last < 60 * 1000) throw C.err(429, 'Patientez une minute avant de redemander un code.');
+    otpCooldown.set(`find:${norm}`, Date.now());
+    const code = generateOtp();
+    await storeOtp(`appfind:${norm}`, code);
+    await sendSms(norm, `UniConnect : votre code est ${code} (valide 5 min).`, { appHash: req.headers['x-app-hash'] });
+    res.json({ message: 'Code envoyé par SMS.' });
+  }));
+  router.post('/public/applications/find/verify', authLimiter, asyncHandler(async (req, res) => {
+    const norm = normalizePhone(req.body.phone || '');
+    if (!norm || !req.body.code) throw C.err(400, 'Téléphone et code requis.');
+    if (!(await verifyAndConsumeOtp(`appfind:${norm}`, req.body.code))) throw C.err(400, 'Code invalide ou expiré.');
+    const rows = (await pool.query('SELECT code, status, full_name FROM applications WHERE phone=$1 ORDER BY created_at DESC', [norm])).rows;
+    res.json({ applications: rows.map((r) => ({ code: r.code, status: r.status, statusLabel: STATUS_FR[r.status], fullName: r.full_name })) });
+  }));
+
   router.get('/public/applications/:code', docLimiter, asyncHandler(async (req, res) => {
     const a = await loadApplication(req.params.code, req.query.phone);
     const docs = (await pool.query('SELECT doc_type FROM application_documents WHERE application_id=$1', [a.id])).rows.map((r) => r.doc_type);
-    res.json({ code: a.code, status: a.status, statusLabel: STATUS_FR[a.status], note: a.note, documents: docs,
+    const files = (await pool.query(
+      `SELECT d.id, d.doc_type, d.created_at, f.original_name, f.size
+         FROM application_documents d LEFT JOIN files f ON f.id=d.file_id
+        WHERE d.application_id=$1 ORDER BY d.created_at`, [a.id])).rows
+      .map((r) => ({ id: r.id, docType: r.doc_type, name: r.original_name, size: r.size, createdAt: r.created_at }));
+    res.json({ code: a.code, status: a.status, statusLabel: STATUS_FR[a.status], note: a.note, documents: docs, files,
       missing: REQUIRED_DOCS.filter((x) => !docs.includes(x)) });
   }));
 
