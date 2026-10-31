@@ -3147,8 +3147,10 @@ const mod_registration = (d, C) => {
   router.get('/admin/applications/:id', requireAuth, SCOL, asyncHandler(async (req, res) => {
     const a = (await pool.query('SELECT * FROM applications WHERE id=$1', [req.params.id])).rows[0];
     if (!a) throw C.err(404, 'Dossier introuvable.');
-    const docs = (await pool.query('SELECT * FROM application_documents WHERE application_id=$1 ORDER BY created_at', [a.id])).rows;
-    res.json({ ...a, documents: docs.map((x) => ({ id: x.id, type: x.doc_type, url: C.fileUrl(x.file_id) })) });
+    const docs = (await pool.query(
+      `SELECT d.*, f.original_name FROM application_documents d LEFT JOIN files f ON f.id=d.file_id
+        WHERE d.application_id=$1 ORDER BY d.doc_type, d.created_at`, [a.id])).rows;
+    res.json({ ...a, documents: docs.map((x) => ({ id: x.id, type: x.doc_type, name: x.original_name, url: C.fileUrl(x.file_id) })) });
   }));
   async function acceptApplication(a, byUser) {
     const docs = (await pool.query('SELECT doc_type FROM application_documents WHERE application_id=$1', [a.id])).rows.map((r) => r.doc_type);
