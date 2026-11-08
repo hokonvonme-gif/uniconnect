@@ -118,7 +118,11 @@ const GSM7 = /^[A-Za-z0-9 \r\n@£$¥èéùìòÇØøÅåΔ_ΦΓΛΩΠΨΣΘΞÆ�
  *  2. Africa's Talking (AT_USERNAME + AT_API_KEY)
  *  3. sinon : affichage dans les logs (développement)
  */
-async function sendSms(phone, message) {
+async function sendSms(phone, message, opts = {}) {
+  // Remplissage automatique de l'OTP (Android SMS Retriever) : le SMS doit
+  // commencer par « <#> » et se terminer par le hash de 11 caractères de l'app.
+  const h = opts && typeof opts.appHash === 'string' ? opts.appHash.trim() : '';
+  if (/^[A-Za-z0-9+\/=]{11}$/.test(h)) message = `<#> ${message}\n${h}`;
   const vKey = process.env.VONAGE_API_KEY;
   const vSecret = process.env.VONAGE_API_SECRET;
   if (vKey && vSecret) {
@@ -681,6 +685,10 @@ const NOTIF_I18N = {
     fr: { title: 'Document prêt', body: 'Votre demande ({type}) est prête à télécharger.' },
     en: { title: 'Document ready', body: 'Your request ({type}) is ready to download.' },
   },
+  application_submitted: {
+    fr: { title: 'Nouveau dossier à examiner', body: '{name} ({program}) a soumis le dossier {code}.' },
+    en: { title: 'New application to review', body: '{name} ({program}) submitted application {code}.' },
+  },
   attendance_alert: {
     fr: { title: 'Assiduité', body: 'Attention : absences élevées en {course}.' },
     en: { title: 'Attendance', body: 'Warning: high absences in {course}.' },
@@ -826,7 +834,7 @@ router.post(
 
     const code = generateOtp();
     await storeOtp(`phone:${norm}`, code);
-    await sendSms(norm, `UniConnect : votre code est ${code} (valide 5 min).`);
+    await sendSms(norm, `UniConnect : votre code est ${code} (valide 5 min).`, { appHash: req.headers['x-app-hash'] });
     res.json({ message: 'Code OTP envoyé par SMS.', phone: norm.replace(/(\d{3})\d+(\d{2})/, '$1****$2') });
   }),
 );
@@ -932,7 +940,7 @@ router.post(
         [challengeId, u.id, code, String(OTP_TTL_SECONDS)],
       );
       const msg = `UniConnect : code de connexion ${code} (valide 5 min).`;
-      if (u.phone) await sendSms(u.phone, msg);
+      if (u.phone) await sendSms(u.phone, msg, { appHash: req.headers['x-app-hash'] });
       else await sendEmail({ to: u.email, subject: 'Code de connexion', text: msg });
       return res.json({ requiresOtp: true, challengeId, channel: u.phone ? 'sms' : 'email' });
     }
@@ -1841,7 +1849,7 @@ const mod_auth_extra = (d, C) => {
       const code = generateOtp();
       await storeOtp(`reset:${u.id}`, code);
       const msg = `UniConnect : code de réinitialisation ${code} (valide 5 min).`;
-      if (u.phone) await sendSms(u.phone, msg);
+      if (u.phone) await sendSms(u.phone, msg, { appHash: req.headers['x-app-hash'] });
       else if (u.email) await sendEmail({ to: u.email, subject: 'Réinitialisation du mot de passe', text: msg });
     }
     res.json({ message: 'Si le compte existe, un code a été envoyé.' });
@@ -3009,13 +3017,21 @@ const mod_registration = (d, C) => {
     res.json({ requiredDocuments: REQUIRED_DOCS, programs: programs.map((p) => ({ ...p, levels: levels.filter((l) => l.program_id === p.id) })) });
   }));
   router.post('/public/applications', authLimiter, asyncHandler(async (req, res) => {
-    const { fullName, phone, email, birthDate, programId, levelId } = req.body;
-    if (!fullName || !phone || !programId) throw C.err(400, 'Nom, téléphone et filière requis.');
+    const { fullName, phone, email, birthDate, programId, levelId, programName, levelName } = req.body;
+    // Accepte soit un programId (UUID) soit un programName en texte libre
+    if (!fullName || !phone || (!programId && !programName)) {
+      throw C.err(400, 'Nom, téléphone et filière requis.');
+    }
     const code = `PRE-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
     const id = crypto.randomUUID();
+    // Note stocke la filière/niveau saisis en libre si pas d'ID
+    const noteParts = [];
+    if (programName) noteParts.push(`Filière: ${String(programName).trim()}`);
+    if (levelName) noteParts.push(`Niveau: ${String(levelName).trim()}`);
+    const note = noteParts.length ? noteParts.join(' | ') : null;
     await pool.query(
-      `INSERT INTO applications (id, code, full_name, phone, email, birth_date, program_id, level_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [id, code, fullName, normalizePhone(phone), email ? normalizeEmail(email) : null, birthDate || null, programId, levelId || null]);
+      `INSERT INTO applications (id, code, full_name, phone, email, birth_date, program_id, level_id, note) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+      [id, code, fullName, normalizePhone(phone), email ? normalizeEmail(email) : null, birthDate || null, programId || null, levelId || null, note]);
     await sendSms(normalizePhone(phone), `UniConnect : dossier ${code} reçu. Déposez vos pièces et suivez son état avec ce code.`);
     res.status(201).json({ code, requiredDocuments: REQUIRED_DOCS, message: 'Dossier créé. Déposez maintenant vos pièces justificatives.' });
   }));
@@ -3024,25 +3040,113 @@ const mod_registration = (d, C) => {
     if (!a || normalizePhone(phone || '') !== a.phone) throw C.err(404, 'Dossier introuvable (vérifiez le code et le téléphone).');
     return a;
   }
-  router.post('/public/applications/:code/documents', authLimiter, upload.single('file'), asyncHandler(async (req, res) => {
+  // Limiteur dédié : plusieurs étudiants partagent souvent la même IP mobile (CGNAT)
+  const docLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, max: 150, standardHeaders: true,
+    keyGenerator: (req) => `${req.ip}|${String(req.params.code || '').toUpperCase()}`,
+    handler: (_req, res) => res.status(429).json({ message: 'Trop de tentatives, réessayez dans quelques minutes.' }),
+  });
+  // Détection du vrai type de fichier (le téléphone envoie souvent application/octet-stream)
+  function sniffMime(buf) {
+    if (!buf || buf.length < 12) return null;
+    if (buf.slice(0, 4).toString('latin1') === '%PDF') return 'application/pdf';
+    if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
+    if (buf.slice(1, 4).toString('latin1') === 'PNG') return 'image/png';
+    if (buf.slice(0, 4).toString('latin1') === 'RIFF' && buf.slice(8, 12).toString('latin1') === 'WEBP') return 'image/webp';
+    return null;
+  }
+  router.post('/public/applications/:code/documents', docLimiter, upload.single('file'), asyncHandler(async (req, res) => {
     const a = await loadApplication(req.params.code, req.body.phone || req.query.phone);
     if (['accepte', 'refuse'].includes(a.status)) throw C.err(400, 'Dossier clôturé.');
     if (!DOC_TYPES.includes(req.body.docType)) throw C.err(400, `docType invalide (${DOC_TYPES.join(', ')}).`);
-    if (!req.file || !/^(application\/pdf|image\/(jpeg|png|webp))$/.test(req.file.mimetype)) throw C.err(400, 'Fichier PDF ou image requis.');
-    const count = Number((await pool.query('SELECT COUNT(*) FROM application_documents WHERE application_id=$1', [a.id])).rows[0].count);
-    if (count >= 12) throw C.err(400, 'Nombre maximal de pièces atteint.');
-    const fileId = await C.saveFile(req.file, null);
-    if (req.body.docType !== 'autre') {
+    if (!req.file) throw C.err(400, 'Aucun fichier reçu. Réessayez.');
+    const realMime = sniffMime(req.file.buffer);
+    if (!realMime) throw C.err(400, 'Format non pris en charge : envoyez un PDF, JPG ou PNG.');
+    req.file.mimetype = realMime;
+    // Plusieurs fichiers par pièce (jusqu'à 10) ; replace=1 remplace tous les fichiers de la pièce.
+    if (['1', 'true'].includes(String(req.body.replace))) {
       await pool.query('DELETE FROM application_documents WHERE application_id=$1 AND doc_type=$2', [a.id, req.body.docType]);
     }
+    const perType = Number((await pool.query('SELECT COUNT(*) FROM application_documents WHERE application_id=$1 AND doc_type=$2', [a.id, req.body.docType])).rows[0].count);
+    if (perType >= 10) throw C.err(400, 'Maximum 10 fichiers pour cette pièce.');
+    const count = Number((await pool.query('SELECT COUNT(*) FROM application_documents WHERE application_id=$1', [a.id])).rows[0].count);
+    if (count >= 60) throw C.err(400, 'Nombre maximal de fichiers atteint.');
+    const fileId = await C.saveFile(req.file, null);
     await pool.query('INSERT INTO application_documents (id, application_id, doc_type, file_id) VALUES ($1,$2,$3,$4)', [crypto.randomUUID(), a.id, req.body.docType, fileId]);
     if (a.status === 'pieces_manquantes') await pool.query(`UPDATE applications SET status='en_examen', updated_at=now() WHERE id=$1`, [a.id]);
     res.status(201).json({ message: 'Pièce enregistrée.' });
   }));
-  router.get('/public/applications/:code', authLimiter, asyncHandler(async (req, res) => {
+  router.delete('/public/applications/:code/documents/:docType', docLimiter, asyncHandler(async (req, res) => {
+    const a = await loadApplication(req.params.code, req.query.phone);
+    if (['accepte', 'refuse'].includes(a.status)) throw C.err(400, 'Dossier clôturé.');
+    if (!DOC_TYPES.includes(req.params.docType)) throw C.err(400, 'docType invalide.');
+    await pool.query('DELETE FROM application_documents WHERE application_id=$1 AND doc_type=$2', [a.id, req.params.docType]);
+    res.json({ message: 'Fichiers supprimés.' });
+  }));
+  // Soumettre le dossier à la scolarité (toutes les pièces requises doivent être présentes)
+  router.post('/public/applications/:code/submit', docLimiter, asyncHandler(async (req, res) => {
+    const a = await loadApplication(req.params.code, req.body.phone || req.query.phone);
+    if (['accepte', 'refuse'].includes(a.status)) throw C.err(400, 'Dossier déjà clôturé.');
+    const docs = (await pool.query('SELECT doc_type FROM application_documents WHERE application_id=$1', [a.id])).rows.map((r) => r.doc_type);
+    const missing = REQUIRED_DOCS.filter((x) => !docs.includes(x));
+    if (missing.length) throw C.err(400, `Pièces manquantes : ${missing.join(', ')}.`);
+    const wasResubmission = a.status === 'pieces_manquantes';
+    await pool.query(`UPDATE applications SET status='en_examen', updated_at=now() WHERE id=$1`, [a.id]);
+    // Alerte la scolarité et l'administration (notification dans l'app + push si activé)
+    try {
+      const prog = a.program_id ? (await pool.query('SELECT name FROM programs WHERE id=$1', [a.program_id])).rows[0] : null;
+      const staff = (await pool.query(`SELECT id FROM users WHERE role IN ('scolarite','admin')`)).rows;
+      for (const u of staff) {
+        await notifyUser(u.id, 'application_submitted',
+          { name: a.full_name, program: prog?.name || '—', code: a.code }, { applicationId: a.id, resubmission: wasResubmission }).catch(() => {});
+      }
+    } catch (e) { console.error('[notif dossier]', e.message); }
+    try {
+      await sendSms(a.phone, `UniConnect : votre dossier ${a.code} est complet et en cours d'examen. Vous recevrez votre matricule par SMS dès la validation.`);
+    } catch (_) {}
+    res.json({ message: 'Dossier soumis à la scolarité.', status: 'en_examen' });
+  }));
+
+  // Supprimer un seul fichier d'une pièce
+  router.delete('/public/applications/:code/documents/file/:docId', docLimiter, asyncHandler(async (req, res) => {
+    const a = await loadApplication(req.params.code, req.query.phone);
+    if (['accepte', 'refuse'].includes(a.status)) throw C.err(400, 'Dossier clôturé.');
+    await pool.query('DELETE FROM application_documents WHERE id=$1 AND application_id=$2', [req.params.docId, a.id]);
+    res.json({ message: 'Fichier supprimé.' });
+  }));
+
+  // Retrouver son dossier depuis la base (autre téléphone, app réinstallée, redémarrage…)
+  // en confirmant le numéro par SMS. Rien n'est conservé sur le mobile.
+  router.post('/public/applications/find/request', authLimiter, asyncHandler(async (req, res) => {
+    const norm = normalizePhone(req.body.phone || '');
+    if (norm.length < 8) throw C.err(400, 'Numéro de téléphone invalide.');
+    const found = await pool.query('SELECT 1 FROM applications WHERE phone=$1 LIMIT 1', [norm]);
+    if (!found.rowCount) throw C.err(404, 'Aucun dossier trouvé pour ce numéro.');
+    const last = otpCooldown.get(`find:${norm}`) || 0;
+    if (Date.now() - last < 60 * 1000) throw C.err(429, 'Patientez une minute avant de redemander un code.');
+    otpCooldown.set(`find:${norm}`, Date.now());
+    const code = generateOtp();
+    await storeOtp(`appfind:${norm}`, code);
+    await sendSms(norm, `UniConnect : votre code est ${code} (valide 5 min).`, { appHash: req.headers['x-app-hash'] });
+    res.json({ message: 'Code envoyé par SMS.' });
+  }));
+  router.post('/public/applications/find/verify', authLimiter, asyncHandler(async (req, res) => {
+    const norm = normalizePhone(req.body.phone || '');
+    if (!norm || !req.body.code) throw C.err(400, 'Téléphone et code requis.');
+    if (!(await verifyAndConsumeOtp(`appfind:${norm}`, req.body.code))) throw C.err(400, 'Code invalide ou expiré.');
+    const rows = (await pool.query('SELECT code, status, full_name FROM applications WHERE phone=$1 ORDER BY created_at DESC', [norm])).rows;
+    res.json({ applications: rows.map((r) => ({ code: r.code, status: r.status, statusLabel: STATUS_FR[r.status], fullName: r.full_name })) });
+  }));
+
+  router.get('/public/applications/:code', docLimiter, asyncHandler(async (req, res) => {
     const a = await loadApplication(req.params.code, req.query.phone);
     const docs = (await pool.query('SELECT doc_type FROM application_documents WHERE application_id=$1', [a.id])).rows.map((r) => r.doc_type);
-    res.json({ code: a.code, status: a.status, statusLabel: STATUS_FR[a.status], note: a.note, documents: docs,
+    const files = (await pool.query(
+      `SELECT d.id, d.doc_type, d.created_at, f.original_name, f.size
+         FROM application_documents d LEFT JOIN files f ON f.id=d.file_id
+        WHERE d.application_id=$1 ORDER BY d.created_at`, [a.id])).rows
+      .map((r) => ({ id: r.id, docType: r.doc_type, name: r.original_name, size: r.size, createdAt: r.created_at }));
+    res.json({ code: a.code, status: a.status, statusLabel: STATUS_FR[a.status], note: a.note, documents: docs, files,
       missing: REQUIRED_DOCS.filter((x) => !docs.includes(x)) });
   }));
 
@@ -3057,8 +3161,10 @@ const mod_registration = (d, C) => {
   router.get('/admin/applications/:id', requireAuth, SCOL, asyncHandler(async (req, res) => {
     const a = (await pool.query('SELECT * FROM applications WHERE id=$1', [req.params.id])).rows[0];
     if (!a) throw C.err(404, 'Dossier introuvable.');
-    const docs = (await pool.query('SELECT * FROM application_documents WHERE application_id=$1 ORDER BY created_at', [a.id])).rows;
-    res.json({ ...a, documents: docs.map((x) => ({ id: x.id, type: x.doc_type, url: C.fileUrl(x.file_id) })) });
+    const docs = (await pool.query(
+      `SELECT d.*, f.original_name FROM application_documents d LEFT JOIN files f ON f.id=d.file_id
+        WHERE d.application_id=$1 ORDER BY d.doc_type, d.created_at`, [a.id])).rows;
+    res.json({ ...a, documents: docs.map((x) => ({ id: x.id, type: x.doc_type, name: x.original_name, url: C.fileUrl(x.file_id) })) });
   }));
   async function acceptApplication(a, byUser) {
     const docs = (await pool.query('SELECT doc_type FROM application_documents WHERE application_id=$1', [a.id])).rows.map((r) => r.doc_type);
@@ -3847,6 +3953,11 @@ app.get('/health', async (req, res) => {
 app.use('/api/v1', router);
 
 app.use((err, req, res, next) => {
+  if (err && err.name === 'MulterError') {
+    const big = err.code === 'LIMIT_FILE_SIZE';
+    return res.status(big ? 413 : 400).json({ statusCode: big ? 413 : 400,
+      message: big ? 'Fichier trop volumineux (8 Mo maximum).' : 'Envoi du fichier impossible.', path: req.originalUrl });
+  }
   console.error(`[Erreur] ${req.method} ${req.originalUrl} →`, err.message);
   const pg = { '23505': [409, 'Cette valeur existe déjà.'], '23503': [409, 'Élément lié à d’autres données.'],
     '22P02': [400, 'Identifiant ou format invalide.'], '23514': [400, 'Valeur non autorisée.'] }[err.code];
