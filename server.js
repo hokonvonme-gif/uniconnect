@@ -903,6 +903,11 @@ router.post(
       return res.status(423).json({ message: 'Compte temporairement verrouillé.' });
     }
     if (!u.password_hash) {
+      if (u.role && u.role !== 'etudiant') {
+        return res.status(400).json({
+          message: 'Mot de passe non défini pour ce compte. Contactez un administrateur.',
+        });
+      }
       return res.status(400).json({ message: "Activez d'abord votre compte (OTP)." });
     }
 
@@ -1153,6 +1158,160 @@ router.post(
     await app.locals.syncStudent(userId);
     await audit(req.user.id, 'create_student', 'user', userId, { matricule }, req.ip);
     res.status(201).json({ userId, matricule, message: 'Étudiant créé. Il pourra activer son compte via OTP.' });
+  }),
+);
+
+
+/** Limite de comptes actifs par profil personnel (parallèles, mêmes droits). */
+const STAFF_ROLE_LIMIT = Math.max(1, parseInt(process.env.STAFF_ROLE_LIMIT || '5', 10));
+const STAFF_ROLES = ['enseignant', 'scolarite', 'comptabilite', 'directeur', 'admin'];
+
+/**
+ * Pré-enregistrement d'un membre du personnel.
+ * Body: { fullName, role, email?, phone?, password? }
+ * - role obligatoire (enseignant|scolarite|comptabilite|directeur|admin)
+ * - email et/ou phone obligatoires (au moins un) — les deux recommandés pour lier le mot de passe
+ * - password optionnel : si fourni, le personnel peut se connecter immédiatement
+ *   avec l'email OU le téléphone + ce même mot de passe
+ * - max STAFF_ROLE_LIMIT (défaut 5) comptes actifs par rôle
+ */
+router.post(
+  '/admin/staff',
+  requireAuth,
+  requireRole('admin'),
+  asyncHandler(async (req, res) => {
+    const { fullName, role, email, phone, password } = req.body || {};
+    if (!fullName || !role) {
+      return res.status(400).json({ message: 'fullName et role requis.' });
+    }
+    if (!STAFF_ROLES.includes(role)) {
+      return res.status(400).json({
+        message: `role invalide. Valeurs: ${STAFF_ROLES.join(', ')}`,
+      });
+    }
+    if (!email && !phone) {
+      return res.status(400).json({ message: 'email ou phone requis (idéalement les deux).' });
+    }
+
+    const em = email ? normalizeEmail(email) : null;
+    const ph = phone ? normalizePhone(phone) : null;
+
+    // Quota par profil
+    const cnt = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM users WHERE role = $1 AND is_active = true`,
+      [role],
+    );
+    if (cnt.rows[0].n >= STAFF_ROLE_LIMIT) {
+      return res.status(409).json({
+        message: `Limite atteinte : maximum ${STAFF_ROLE_LIMIT} comptes actifs pour le profil « ${role} ».`,
+        limit: STAFF_ROLE_LIMIT,
+        current: cnt.rows[0].n,
+      });
+    }
+
+    // Unicité email / phone
+    if (em) {
+      const ex = await pool.query(`SELECT id FROM users WHERE email = $1`, [em]);
+      if (ex.rowCount) return res.status(409).json({ message: 'Cet e-mail est déjà enregistré.' });
+    }
+    if (ph) {
+      const ex = await pool.query(`SELECT id FROM users WHERE phone = $1`, [ph]);
+      if (ex.rowCount) return res.status(409).json({ message: 'Ce téléphone est déjà enregistré.' });
+    }
+
+    const userId = crypto.randomUUID();
+    let passwordHash = null;
+    if (password && String(password).length >= 8) {
+      passwordHash = await bcrypt.hash(String(password), BCRYPT_COST);
+    }
+
+    await pool.query(
+      `INSERT INTO users (id, full_name, email, phone, role, password_hash, phone_verified, email_verified, is_active)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,true)`,
+      [
+        userId,
+        String(fullName).trim(),
+        em,
+        ph,
+        role,
+        passwordHash,
+        !!ph,
+        !!em,
+      ],
+    );
+
+    if (role === 'enseignant') {
+      await pool.query(
+        `INSERT INTO teachers (user_id) VALUES ($1) ON CONFLICT DO NOTHING`,
+        [userId],
+      ).catch(() => {});
+    }
+
+    await audit(req.user.id, 'create_staff', 'user', userId, { role, email: em, phone: ph }, req.ip);
+    res.status(201).json({
+      userId,
+      role,
+      email: em,
+      phone: ph,
+      passwordSet: !!passwordHash,
+      message: passwordHash
+        ? 'Personnel créé. Connexion possible avec e-mail ou téléphone + mot de passe.'
+        : "Personnel créé sans mot de passe. Définissez un mot de passe (admin) ou activez le compte.",
+    });
+  }),
+);
+
+/** Définir / réinitialiser le mot de passe d'un personnel (lié à email ET téléphone du compte). */
+router.post(
+  '/admin/staff/:id/set-password',
+  requireAuth,
+  requireRole('admin'),
+  asyncHandler(async (req, res) => {
+    const { password } = req.body || {};
+    if (!password || String(password).length < 8) {
+      return res.status(400).json({ message: 'Mot de passe : 8 caractères minimum.' });
+    }
+    const u = (await pool.query(`SELECT * FROM users WHERE id = $1`, [req.params.id])).rows[0];
+    if (!u) return res.status(404).json({ message: 'Utilisateur introuvable.' });
+    if (u.role === 'etudiant') {
+      return res.status(400).json({ message: 'Utilisez le flux étudiant pour les comptes étudiants.' });
+    }
+    const hash = await bcrypt.hash(String(password), BCRYPT_COST);
+    await pool.query(
+      `UPDATE users SET password_hash = $1, failed_login_attempts = 0, locked_until = NULL, updated_at = now() WHERE id = $2`,
+      [hash, u.id],
+    );
+    await audit(req.user.id, 'set_staff_password', 'user', u.id, {}, req.ip);
+    res.json({
+      message: 'Mot de passe enregistré. Il est lié à l’e-mail et au téléphone du compte.',
+      email: u.email,
+      phone: u.phone,
+    });
+  }),
+);
+
+/** Liste du personnel groupée par rôle + compteurs / limites */
+router.get(
+  '/admin/staff',
+  requireAuth,
+  requireRole('admin', 'directeur'),
+  asyncHandler(async (req, res) => {
+    const rows = (
+      await pool.query(
+        `SELECT * FROM users WHERE role = ANY($1) ORDER BY role, full_name`,
+        [STAFF_ROLES],
+      )
+    ).rows;
+    const byRole = {};
+    for (const role of STAFF_ROLES) {
+      const list = rows.filter((r) => r.role === role);
+      byRole[role] = {
+        limit: STAFF_ROLE_LIMIT,
+        active: list.filter((r) => r.is_active).length,
+        users: list.map(serializeUser),
+      };
+    }
+    res.json({ limitPerRole: STAFF_ROLE_LIMIT, roles: byRole });
   }),
 );
 
